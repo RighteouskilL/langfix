@@ -157,3 +157,34 @@ def fix_text_manual(text):
         return "".join(fixed), "thai"
     else:
         return text.translate(thai_to_eng_map), "eng"
+
+def get_suggestions(prefix, max_results=3):
+    if not prefix or len(prefix) < 2:
+        return None, prefix
+        
+    ignores = load_ignore_list()
+    if prefix in ignores:
+        return None, prefix
+        
+    # Check if the prefix is typed in the wrong layout (English characters but likely meant to be Thai)
+    is_gib, translated = is_gibberish_english(prefix)
+    
+    # Check if the translated or original prefix is in ignores
+    if translated in ignores:
+        return None, prefix
+        
+    search_prefix = translated if is_gib else prefix
+    
+    # We only support suggesting Thai words from the corpus for now
+    if any(c in ENG_CHARS for c in search_prefix) and not is_gib:
+        return None, prefix
+        
+    suggestions = [w for w in valid_thai_words_set if w.startswith(search_prefix)]
+    # Sort by length so shorter, more common words appear first
+    suggestions.sort(key=len)
+    
+    if not suggestions:
+        return None, prefix
+        
+    return suggestions[:max_results], search_prefix
+
