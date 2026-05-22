@@ -7,6 +7,7 @@ from pynput import keyboard
 import pystray
 from PIL import Image, ImageDraw
 import logging
+import logging.handlers
 
 # Local modules
 from autocorrect import is_gibberish_english, is_gibberish_thai, fix_text_manual, valid_thai_words_set, add_to_ignore_list, IGNORE_FILE, simulate_thai_output, get_suggestions
@@ -15,8 +16,14 @@ import subprocess
 import tkinter as tk
 from ctypes import wintypes
 
-logging.basicConfig(filename='langfix.log', level=logging.DEBUG, 
-                    format='%(asctime)s - %(levelname)s - %(message)s')
+log_handler = logging.handlers.RotatingFileHandler(
+    'langfix.log', maxBytes=1_000_000, backupCount=3, encoding='utf-8'
+)
+logging.basicConfig(
+    handlers=[log_handler],
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
 controller = keyboard.Controller()
 key_queue = queue.Queue()
@@ -277,80 +284,26 @@ def worker_thread():
             item = key_queue.get(timeout=timeout_val)
 
             if item == "SPACE":
-                # Space arrived via on_press (buffer was empty at hook time)
-                # Just clear; space already printed to screen
+                # Space already went to the OS; process buffer and correct if gibberish.
+                # process_buffer trigger="SPACE" will add +1 to backspace count for the space.
                 ui_queue.put(None)
-                current_word_buffer.clear()
                 current_suggestions = []
+                if current_word_buffer:
+                    buf_copy = list(current_word_buffer)
+                    current_word_buffer.clear()
+                    process_buffer(buf_copy, trigger="SPACE")
+                else:
+                    current_word_buffer.clear()
 
             elif item == "ENTER":
-                # Enter arrived via on_press (buffer was empty at hook time)
                 ui_queue.put(None)
-                current_word_buffer.clear()
                 current_suggestions = []
-
-            elif item == "CHECK_SPACE":
-                # Space was blocked by hook; evaluate gibberish here and decide
-                buf_copy = list(current_word_buffer)
-                current_word_buffer.clear()
-                current_suggestions = []
-                ui_queue.put(None)
-
-                if buf_copy:
-                    raw_prefix = "".join(buf_copy)
-                    layout = get_current_keyboard_layout()
-                    is_gib = False
-                    if layout == LANG_ENG:
-                        is_gib, _ = is_gibberish_english(raw_prefix)
-                    else:
-                        is_gib, _ = is_gibberish_thai(raw_prefix)
-
-                    if is_gib:
-                        process_buffer(buf_copy, trigger="GIB_SPACE")
-                    else:
-                        # Normal word — release the blocked space
-                        is_simulating = True
-                        controller.type(" ")
-                        time.sleep(0.05)
-                        is_simulating = False
+                if current_word_buffer:
+                    buf_copy = list(current_word_buffer)
+                    current_word_buffer.clear()
+                    process_buffer(buf_copy, trigger="ENTER")
                 else:
-                    # Empty buffer — just release the space
-                    is_simulating = True
-                    controller.type(" ")
-                    time.sleep(0.05)
-                    is_simulating = False
-
-            elif item == "CHECK_ENTER":
-                # Enter was blocked by hook; evaluate gibberish here and decide
-                buf_copy = list(current_word_buffer)
-                current_word_buffer.clear()
-                current_suggestions = []
-                ui_queue.put(None)
-
-                if buf_copy:
-                    raw_prefix = "".join(buf_copy)
-                    layout = get_current_keyboard_layout()
-                    is_gib = False
-                    if layout == LANG_ENG:
-                        is_gib, _ = is_gibberish_english(raw_prefix)
-                    else:
-                        is_gib, _ = is_gibberish_thai(raw_prefix)
-
-                    if is_gib:
-                        process_buffer(buf_copy, trigger="GIB_ENTER")
-                    else:
-                        # Normal word — release the blocked enter
-                        is_simulating = True
-                        controller.press(keyboard.Key.enter)
-                        controller.release(keyboard.Key.enter)
-                        time.sleep(0.05)
-                        is_simulating = False
-                else:
-                    is_simulating = True
-                    controller.press(keyboard.Key.enter)
-                    controller.release(keyboard.Key.enter)
-                    time.sleep(0.05)
-                    is_simulating = False
+                    current_word_buffer.clear()
 
             elif item == "BACKSPACE":
                 if current_word_buffer:
@@ -485,14 +438,9 @@ def on_press(key):
         # On some Thai keyboard layouts, the space bar reports key.char==' ' which
         # would be treated as a regular character if we checked char first.
         if key == keyboard.Key.space or getattr(key, 'char', None) == ' ':
-            # Only enqueue SPACE when buffer is empty.
-            # If buffer is non-empty, win32_event_filter already blocked this key
-            # and sent CHECK_SPACE — sending SPACE here too would cause a double-space.
-            if not current_word_buffer:
-                key_queue.put("SPACE")
+            key_queue.put("SPACE")
         elif key == keyboard.Key.enter or getattr(key, 'char', None) in ('\n', '\r'):
-            if not current_word_buffer:
-                key_queue.put("ENTER")
+            key_queue.put("ENTER")
         elif key == keyboard.Key.backspace:
             key_queue.put("BACKSPACE")
         elif key == keyboard.Key.esc:
@@ -548,16 +496,8 @@ def win32_event_filter(msg, data):
                     key_queue.put("CLEAR")
                 return False
 
-        # --- Block Space/Enter when buffer is non-empty and send to worker for evaluation ---
-        if current_word_buffer and data.vkCode in (0x20, 0x0D):
-            if data.vkCode == 0x20:
-                if msg in (256, 260):
-                    key_queue.put("CHECK_SPACE")
-                return False
-            elif data.vkCode == 0x0D:
-                if msg in (256, 260):
-                    key_queue.put("CHECK_ENTER")
-                return False
+        # (Space/Enter are no longer blocked here — they pass through to the OS
+        #  and on_press sends SPACE/ENTER to worker_thread to trigger process_buffer.)
 
         # --- Global hotkeys (layout-independent via vkCode) ---
         ctrl_pressed = ctypes.windll.user32.GetAsyncKeyState(0x11) & 0x8000
