@@ -81,6 +81,10 @@ valid_thai_words_set = set(thai_words())
 def is_gibberish_english(text):
     logging.debug(f"[ENG_CHECK] Input text: '{text}'")
     
+    # If the text already contains Thai characters, it cannot be gibberish English layout
+    if any(c in THAI_CHARS for c in text):
+        return False, text
+        
     ignores = load_ignore_list()
     if text in ignores:
         return False, text
@@ -119,6 +123,10 @@ def is_gibberish_english(text):
 def is_gibberish_thai(text):
     ignores = load_ignore_list()
     if text in ignores:
+        return False, text
+        
+    # If the text has no Thai characters, it cannot be gibberish Thai layout
+    if not any(c in THAI_CHARS for c in text):
         return False, text
         
     if any(c in THAI_CHARS for c in text):

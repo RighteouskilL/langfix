@@ -1,3 +1,12 @@
+import sys
+import os
+
+# Redirect stdout/stderr to devnull to prevent crashes when compiled with console=False (windowless)
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
+
 import time
 import threading
 import queue
