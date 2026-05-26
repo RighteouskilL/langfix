@@ -45,6 +45,7 @@ class GUITHREADINFO(ctypes.Structure):
         ("hwndCapture", wintypes.HWND),
         ("hwndMenuOwner", wintypes.HWND),
         ("hwndMoveSize", wintypes.HWND),
+        ("hwndCaret", wintypes.HWND),
         ("rcCaret", wintypes.RECT),
     ]
 
