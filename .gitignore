@@ -1,0 +1,21 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Logs
+*.log
+
+
+# User Data
+ignore_list.txt
+langfix.log
+
+# OS generated files
+.DS_Store
+Thumbs.db

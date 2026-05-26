@@ -166,25 +166,45 @@ def get_suggestions(prefix, max_results=3):
     if prefix in ignores:
         return None, prefix
         
-    # Check if the prefix is typed in the wrong layout (English characters but likely meant to be Thai)
-    is_gib, translated = is_gibberish_english(prefix)
+    # Check layout gibberish in both directions
+    is_gib_eng, translated_eng = is_gibberish_english(prefix)
+    is_gib_thai, translated_thai = is_gibberish_thai(prefix)
     
     # Check if the translated or original prefix is in ignores
-    if translated in ignores:
+    if (is_gib_eng and translated_eng in ignores) or (is_gib_thai and translated_thai in ignores):
         return None, prefix
         
-    search_prefix = translated if is_gib else prefix
-    
-    # We only support suggesting Thai words from the corpus for now
-    if any(c in ENG_CHARS for c in search_prefix) and not is_gib:
-        return None, prefix
-        
-    suggestions = [w for w in valid_thai_words_set if w.startswith(search_prefix)]
-    # Sort by length so shorter, more common words appear first
-    suggestions.sort(key=len)
-    
-    if not suggestions:
-        return None, prefix
-        
-    return suggestions[:max_results], search_prefix
+    if is_gib_eng:
+        search_prefix = translated_eng
+        suggestions = [w for w in valid_thai_words_set if w.startswith(search_prefix)]
+        suggestions.sort(key=len)
+        if not suggestions:
+            return None, prefix
+        return suggestions[:max_results], search_prefix
+    elif is_gib_thai:
+        search_prefix = translated_thai
+        candidates = spell.candidates(search_prefix)
+        if candidates:
+            suggestions = [search_prefix] + [c for c in candidates if c != search_prefix]
+        else:
+            suggestions = [search_prefix]
+        return suggestions[:max_results], search_prefix
+    else:
+        # No layout translation needed. Use layout-specific suggestions.
+        search_prefix = prefix
+        if any(c in ENG_CHARS for c in search_prefix):
+            # English prefix. Suggest English spelling corrections.
+            candidates = spell.candidates(search_prefix)
+            if candidates:
+                suggestions = [search_prefix] + [c for c in candidates if c != search_prefix]
+            else:
+                suggestions = [search_prefix]
+            return suggestions[:max_results], search_prefix
+        else:
+            # Thai prefix. Suggest Thai words.
+            suggestions = [w for w in valid_thai_words_set if w.startswith(search_prefix)]
+            suggestions.sort(key=len)
+            if not suggestions:
+                return None, prefix
+            return suggestions[:max_results], search_prefix
 

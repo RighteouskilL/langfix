@@ -36,21 +36,69 @@ HKL_ENG = 0x04090409
 LANG_THAI = 0x041E
 LANG_ENG = 0x0409
 
+class GUITHREADINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("hwndActive", wintypes.HWND),
+        ("hwndFocus", wintypes.HWND),
+        ("hwndCapture", wintypes.HWND),
+        ("hwndMenuOwner", wintypes.HWND),
+        ("hwndMoveSize", wintypes.HWND),
+        ("rcCaret", wintypes.RECT),
+    ]
+
 def get_current_keyboard_layout():
-    hwnd = user32.GetForegroundWindow()
+    # Try using GetGUIThreadInfo first to get the layout of the focused window/thread
+    gui = GUITHREADINFO()
+    gui.cbSize = ctypes.sizeof(GUITHREADINFO)
+    # 0 retrieves information for the active thread (foreground thread)
+    if user32.GetGUIThreadInfo(0, ctypes.byref(gui)) and gui.hwndFocus:
+        hwnd = gui.hwndFocus
+    else:
+        hwnd = user32.GetForegroundWindow()
+        
     if hwnd:
         thread_id = user32.GetWindowThreadProcessId(hwnd, 0)
         hkl = user32.GetKeyboardLayout(thread_id)
         return hkl & 0xFFFF
     return 0
 
-def switch_to_thai():
+def get_active_window_process_name():
     hwnd = user32.GetForegroundWindow()
-    user32.PostMessageW(hwnd, WM_INPUTLANGCHANGEREQUEST, 0, HKL_THAI)
+    if not hwnd:
+        return ""
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    
+    # PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    h_process = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+    if h_process:
+        buf = ctypes.create_unicode_buffer(260)
+        size = wintypes.DWORD(260)
+        if ctypes.windll.kernel32.QueryFullProcessImageNameW(h_process, 0, buf, ctypes.byref(size)):
+            process_name = os.path.basename(buf.value)
+            ctypes.windll.kernel32.CloseHandle(h_process)
+            return process_name.lower()
+        ctypes.windll.kernel32.CloseHandle(h_process)
+    return ""
+
+def get_active_window_handle():
+    gui = GUITHREADINFO()
+    gui.cbSize = ctypes.sizeof(GUITHREADINFO)
+    if user32.GetGUIThreadInfo(0, ctypes.byref(gui)) and gui.hwndFocus:
+        return gui.hwndFocus
+    return user32.GetForegroundWindow()
+
+def switch_to_thai():
+    hwnd = get_active_window_handle()
+    if hwnd:
+        user32.PostMessageW(hwnd, WM_INPUTLANGCHANGEREQUEST, 0, HKL_THAI)
 
 def switch_to_eng():
-    hwnd = user32.GetForegroundWindow()
-    user32.PostMessageW(hwnd, WM_INPUTLANGCHANGEREQUEST, 0, HKL_ENG)
+    hwnd = get_active_window_handle()
+    if hwnd:
+        user32.PostMessageW(hwnd, WM_INPUTLANGCHANGEREQUEST, 0, HKL_ENG)
 
 def wait_for_layout_change(target_lang):
     for _ in range(20):
@@ -219,32 +267,45 @@ def undo_last_correction(add_to_ignore=False):
 
     simulate_backspaces(backspace_count)
 
-    # Use clipboard paste to restore original text.
-    # This is completely layout-independent — avoids controller.type() sending
-    # wrong chars when the current keyboard layout does not match the text (e.g.
-    # typing ASCII 'scroll' while on Thai layout gives Thai chars instead).
-    pyperclip.copy(orig)
-    time.sleep(0.1)
-    v_key = keyboard.KeyCode(vk=0x56)   # Raw VK_V — layout-independent paste
-    controller.press(keyboard.Key.ctrl)
-    controller.press(v_key)
-    controller.release(v_key)
-    controller.release(keyboard.Key.ctrl)
-    time.sleep(0.1)
+    active_proc = get_active_window_process_name()
+    is_terminal = active_proc in {"cmd.exe", "powershell.exe", "pwsh.exe", "windowsterminal.exe", "nvim.exe", "gvim.exe", "wsl.exe", "mintty.exe", "bash.exe", "git-bash.exe", "conhost.exe"}
+
+    if is_terminal:
+        # Switch layout first so simulated typing gets received correctly
+        if orig_layout == LANG_ENG:
+            switch_to_eng()
+            wait_for_layout_change(LANG_ENG)
+        else:
+            switch_to_thai()
+            wait_for_layout_change(LANG_THAI)
+        simulate_type(orig)
+    else:
+        # Use clipboard paste to restore original text.
+        # This is completely layout-independent — avoids controller.type() sending
+        # wrong chars when the current keyboard layout does not match the text.
+        pyperclip.copy(orig)
+        time.sleep(0.1)
+        v_key = keyboard.KeyCode(vk=0x56)   # Raw VK_V — layout-independent paste
+        controller.press(keyboard.Key.ctrl)
+        controller.press(v_key)
+        controller.release(v_key)
+        controller.release(keyboard.Key.ctrl)
+        time.sleep(0.1)
 
     # Restore the separator key that the user originally pressed
     if trigger in ("SPACE", "GIB_SPACE"):
-        controller.type(" ")
+        simulate_type(" ")
     elif trigger in ("ENTER", "GIB_ENTER"):
         controller.press(keyboard.Key.enter)
         controller.release(keyboard.Key.enter)
 
     # Switch layout back to what the user was on originally,
     # so their subsequent typing uses the correct layout
-    if orig_layout == LANG_ENG:
-        switch_to_eng()
-    else:
-        switch_to_thai()
+    if not is_terminal:
+        if orig_layout == LANG_ENG:
+            switch_to_eng()
+        else:
+            switch_to_thai()
 
     time.sleep(0.1)
     with key_queue.mutex:
@@ -415,18 +476,30 @@ def on_manual_fix():
     fixed_text, target_lang = fix_text_manual(text)
 
     if fixed_text != text:
-        pyperclip.copy(fixed_text)
-        time.sleep(0.1)
-        v_key = keyboard.KeyCode(vk=0x56)
-        controller.press(keyboard.Key.ctrl)
-        controller.press(v_key)
-        controller.release(v_key)
-        controller.release(keyboard.Key.ctrl)
+        active_proc = get_active_window_process_name()
+        is_terminal = active_proc in {"cmd.exe", "powershell.exe", "pwsh.exe", "windowsterminal.exe", "nvim.exe", "gvim.exe", "wsl.exe", "mintty.exe", "bash.exe", "git-bash.exe", "conhost.exe"}
 
-        if target_lang == "thai":
-            switch_to_thai()
+        if is_terminal:
+            if target_lang == "thai":
+                switch_to_thai()
+                wait_for_layout_change(LANG_THAI)
+            else:
+                switch_to_eng()
+                wait_for_layout_change(LANG_ENG)
+            simulate_type(fixed_text)
         else:
-            switch_to_eng()
+            pyperclip.copy(fixed_text)
+            time.sleep(0.1)
+            v_key = keyboard.KeyCode(vk=0x56)
+            controller.press(keyboard.Key.ctrl)
+            controller.press(v_key)
+            controller.release(v_key)
+            controller.release(keyboard.Key.ctrl)
+
+            if target_lang == "thai":
+                switch_to_thai()
+            else:
+                switch_to_eng()
 
 
 def on_press(key):
