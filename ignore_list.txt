@@ -1,3 +1,0 @@
-# Add words to ignore (one per line)
-อนสอน
-หนทำ
