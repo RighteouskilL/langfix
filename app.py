@@ -20,10 +20,13 @@ import logging.handlers
 
 # Local modules
 from autocorrect import is_gibberish_english, is_gibberish_thai, fix_text_manual, valid_thai_words_set, add_to_ignore_list, IGNORE_FILE, simulate_thai_output, get_suggestions
-import os
-import subprocess
 import tkinter as tk
 from ctypes import wintypes
+import urllib.request
+import json
+import webbrowser
+
+VERSION = "1.0.0"
 
 log_handler = logging.handlers.RotatingFileHandler(
     'langfix.log', maxBytes=1_000_000, backupCount=3, encoding='utf-8'
@@ -620,6 +623,124 @@ def start_listening():
         pass
 
 
+def show_message(title, message, type="info"):
+    import tkinter as tk
+    from tkinter import messagebox
+    res = False
+    try:
+        temp_root = tk.Tk()
+        temp_root.withdraw()
+        temp_root.attributes("-topmost", True)
+        if type == "info":
+            messagebox.showinfo(title, message, parent=temp_root)
+            res = True
+        elif type == "error":
+            messagebox.showerror(title, message, parent=temp_root)
+            res = True
+        elif type == "yesno":
+            res = messagebox.askyesno(title, message, parent=temp_root)
+        temp_root.destroy()
+    except Exception as e:
+        logging.error(f"Error showing message box: {e}")
+    return res
+
+def perform_update(download_url):
+    import subprocess
+    try:
+        current_exe = sys.executable
+        dir_name = os.path.dirname(current_exe)
+        new_temp_exe = os.path.join(dir_name, "LangFix.exe.new")
+        old_exe = os.path.join(dir_name, "LangFix.exe.old")
+        
+        # Download the new file
+        req = urllib.request.Request(download_url, headers={'User-Agent': 'LangFix-Updater'})
+        with urllib.request.urlopen(req, timeout=30) as response, open(new_temp_exe, 'wb') as out_file:
+            out_file.write(response.read())
+            
+        # Clean up any leftover old exe
+        if os.path.exists(old_exe):
+            try:
+                os.remove(old_exe)
+            except Exception:
+                pass
+                
+        # Rename current exe to old
+        os.rename(current_exe, old_exe)
+        # Rename new temp exe to current name
+        os.rename(new_temp_exe, current_exe)
+        
+        show_message("Update Complete", "LangFix has been updated successfully. The application will now restart.", type="info")
+        
+        # Restart the application
+        subprocess.Popen([current_exe])
+        os._exit(0)
+    except Exception as e:
+        logging.error(f"Update failed: {e}")
+        show_message("Update Failed", f"Failed to update LangFix:\n{e}", type="error")
+
+def delete_old_exe():
+    if getattr(sys, 'frozen', False):
+        try:
+            current_exe = sys.executable
+            dir_name = os.path.dirname(current_exe)
+            old_exe = os.path.join(dir_name, "LangFix.exe.old")
+            if os.path.exists(old_exe):
+                os.remove(old_exe)
+        except Exception as e:
+            logging.error(f"Failed to delete old exe: {e}")
+
+def check_for_updates(manual=True):
+    def run_check():
+        try:
+            url = "https://api.github.com/repos/RighteouskilL/langfix/releases/latest"
+            req = urllib.request.Request(url, headers={'User-Agent': 'LangFix-Updater'})
+            with urllib.request.urlopen(req, timeout=5) as response:
+                data = json.loads(response.read().decode('utf-8'))
+                
+            latest_version = data.get("tag_name", "").lstrip('v')
+            if not latest_version:
+                if manual:
+                    show_message("Check Updates", "Could not retrieve latest version info.", type="info")
+                return
+
+            latest_parts = [int(x) for x in latest_version.split('.') if x.isdigit()]
+            current_parts = [int(x) for x in VERSION.split('.') if x.isdigit()]
+            
+            if latest_parts > current_parts:
+                download_url = None
+                assets = data.get("assets", [])
+                for asset in assets:
+                    if asset.get("name") == "LangFix.exe":
+                        download_url = asset.get("browser_download_url")
+                        break
+                
+                if getattr(sys, 'frozen', False) and download_url:
+                    confirm = show_message(
+                        "Update Available",
+                        f"A new version (v{latest_version}) is available. Would you like to update now?",
+                        type="yesno"
+                    )
+                    if confirm:
+                        perform_update(download_url)
+                else:
+                    confirm = show_message(
+                        "Update Available",
+                        f"A new version (v{latest_version}) is available. Open GitHub to download?",
+                        type="yesno"
+                    )
+                    if confirm:
+                        webbrowser.open(data.get("html_url", "https://github.com/RighteouskilL/langfix/releases/latest"))
+            else:
+                if manual:
+                    show_message("Check Updates", f"You are running the latest version (v{VERSION}).", type="info")
+        except Exception as e:
+            logging.error(f"Error checking for updates: {e}")
+            if manual:
+                show_message("Check Updates", f"Error checking for updates: {e}", type="error")
+                
+    threading.Thread(target=run_check, daemon=True).start()
+
+
 def edit_ignore_list(icon, item):
     if not os.path.exists(IGNORE_FILE):
         with open(IGNORE_FILE, 'w', encoding='utf-8') as f:
@@ -633,6 +754,7 @@ def setup_tray():
     d.text((20, 24), "LF", fill=(255, 255, 255))
 
     menu = pystray.Menu(
+        pystray.MenuItem('Check for Updates', lambda icon, item: check_for_updates(manual=True)),
         pystray.MenuItem('Edit Ignore List', edit_ignore_list),
         pystray.MenuItem('Quit LangFix', lambda icon, item: [icon.stop(), __import__('os')._exit(0)])
     )
@@ -663,10 +785,18 @@ def ui_thread():
     sugg_labels = []
 
     def check_queue():
-        try:
-            data = ui_queue.get_nowait()
-            if data:
-                suggs, sel_idx = data
+        last_data = None
+        has_data = False
+        while True:
+            try:
+                last_data = ui_queue.get_nowait()
+                has_data = True
+            except queue.Empty:
+                break
+
+        if has_data:
+            if last_data:
+                suggs, sel_idx = last_data
 
                 for lbl in sugg_labels:
                     lbl.destroy()
@@ -697,8 +827,6 @@ def ui_thread():
                 root.attributes("-alpha", 0.95)
             else:
                 root.attributes("-alpha", 0.0)
-        except queue.Empty:
-            pass
         root.after(50, check_queue)
 
     root.after(50, check_queue)
@@ -706,6 +834,9 @@ def ui_thread():
 
 
 if __name__ == "__main__":
+    delete_old_exe()
+    check_for_updates(manual=False)
+
     t = threading.Thread(target=worker_thread, daemon=True)
     t.start()
 

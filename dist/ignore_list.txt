@@ -1,1 +1,2 @@
 # Add words to ignore (one per line)
+cd
