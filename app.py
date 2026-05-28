@@ -19,7 +19,7 @@ import logging
 import logging.handlers
 
 # Local modules
-from autocorrect import is_gibberish_english, is_gibberish_thai, fix_text_manual, valid_thai_words_set, add_to_ignore_list, IGNORE_FILE, simulate_thai_output, get_suggestions
+from autocorrect import is_gibberish_english, is_gibberish_thai, fix_text_manual, valid_thai_words_set, add_to_ignore_list, IGNORE_FILE, simulate_thai_output, get_suggestions, ENG_CHARS, THAI_CHARS, eng_to_thai_map, thai_to_eng_map
 import tkinter as tk
 from ctypes import wintypes
 import urllib.request
@@ -62,20 +62,31 @@ class GUITHREADINFO(ctypes.Structure):
     ]
 
 def get_current_keyboard_layout():
-    # Try using GetGUIThreadInfo first to get the layout of the focused window/thread
-    gui = GUITHREADINFO()
-    gui.cbSize = ctypes.sizeof(GUITHREADINFO)
-    # 0 retrieves information for the active thread (foreground thread)
-    if user32.GetGUIThreadInfo(0, ctypes.byref(gui)) and gui.hwndFocus:
-        hwnd = gui.hwndFocus
-    else:
-        hwnd = user32.GetForegroundWindow()
-        
-    if hwnd:
-        thread_id = user32.GetWindowThreadProcessId(hwnd, 0)
-        hkl = user32.GetKeyboardLayout(thread_id)
-        return hkl & 0xFFFF
-    return 0
+    hwnd = ctypes.windll.user32.GetForegroundWindow()
+    if not hwnd:
+        return 0
+
+    class GUITHREADINFO(ctypes.Structure):
+        _fields_ = [("cbSize", ctypes.wintypes.DWORD),
+                    ("flags", ctypes.wintypes.DWORD),
+                    ("hwndActive", ctypes.wintypes.HWND),
+                    ("hwndFocus", ctypes.wintypes.HWND),
+                    ("hwndCapture", ctypes.wintypes.HWND),
+                    ("hwndMenuOwner", ctypes.wintypes.HWND),
+                    ("hwndMoveSize", ctypes.wintypes.HWND),
+                    ("hwndCaret", ctypes.wintypes.HWND),
+                    ("rcCaret", ctypes.wintypes.RECT)]
+
+    gti = GUITHREADINFO()
+    gti.cbSize = ctypes.sizeof(GUITHREADINFO)
+
+    thread_id = ctypes.windll.user32.GetWindowThreadProcessId(hwnd, 0)
+    if ctypes.windll.user32.GetGUIThreadInfo(thread_id, ctypes.byref(gti)):
+        if gti.hwndFocus:
+            thread_id = ctypes.windll.user32.GetWindowThreadProcessId(gti.hwndFocus, 0)
+
+    layout_id = ctypes.windll.user32.GetKeyboardLayout(thread_id)
+    return layout_id & 0xFFFF
 
 def get_active_window_process_name():
     hwnd = user32.GetForegroundWindow()
@@ -170,6 +181,44 @@ def simulate_type(text):
     controller.type(text)
     time.sleep(0.05)
 
+def type_text_smart(text):
+    global is_simulating
+    is_simulating = True
+    active_proc = get_active_window_process_name()
+    is_terminal = active_proc in {"cmd.exe", "powershell.exe", "pwsh.exe", "windowsterminal.exe", "nvim.exe", "gvim.exe", "wsl.exe", "mintty.exe", "bash.exe", "git-bash.exe", "conhost.exe"}
+    
+    if is_terminal:
+        controller.type(text)
+        time.sleep(0.05)
+    else:
+        try:
+            old_clip = pyperclip.paste()
+        except Exception:
+            old_clip = ""
+            
+        pyperclip.copy(text)
+        time.sleep(0.1)
+        
+        v_key = keyboard.KeyCode(vk=0x56) # VK_V
+        controller.press(keyboard.Key.ctrl)
+        controller.press(v_key)
+        controller.release(v_key)
+        controller.release(keyboard.Key.ctrl)
+        
+        time.sleep(0.1)
+        
+        def restore_clipboard():
+            import time
+            time.sleep(0.5)
+            try:
+                if old_clip:
+                    pyperclip.copy(old_clip)
+            except Exception:
+                pass
+                
+        import threading
+        threading.Thread(target=restore_clipboard, daemon=True).start()
+
 
 def process_buffer(buffer, trigger="TIMEOUT"):
     """Detect gibberish and correct it. Called from worker_thread only."""
@@ -180,80 +229,89 @@ def process_buffer(buffer, trigger="TIMEOUT"):
 
     layout = get_current_keyboard_layout()
 
-    if layout == LANG_THAI:
-        # Simulate what actually got rendered on screen (Thai has dead keys)
+    # Determine input type by characters
+    has_thai = any(c in THAI_CHARS for c in text)
+
+    if has_thai:
         actual_rendered_text = simulate_thai_output(text)
         backspace_count = len(actual_rendered_text)
     else:
+        actual_rendered_text = text
         backspace_count = len(text)
 
-    # SPACE / ENTER: key was already printed on screen before we process → need +1
-    # GIB_SPACE / GIB_ENTER: hook blocks the key but Windows may release it anyway
-    #   due to hook timeout — so we always add +1 to be safe.
     if trigger in ("SPACE", "ENTER", "GIB_SPACE", "GIB_ENTER"):
         backspace_count += 1
 
+    # Normalize text based on current layout to fix pynput capturing wrong chars
+    is_gib_eng, thai_text = False, text
+    is_gib_thai, eng_text = False, text
+
     if layout == LANG_ENG:
-        is_gib, thai_text = is_gibberish_english(text)
-        if is_gib:
-            from pythainlp import word_tokenize
-            from pythainlp.spell import correct
-            from pythainlp.util import isthai
-
-            tokens = word_tokenize(thai_text, engine="newmm")
-            fixed = [correct(t) if isthai(t) and t not in valid_thai_words_set else t for t in tokens]
-            final_thai_text = "".join(fixed)
-
-            last_correction = {
-                'original_text': text,
-                'corrected_text': final_thai_text,
-                'original_layout': layout,
-                'new_layout': LANG_THAI,
-                'trigger': trigger
-            }
-            simulate_backspaces(backspace_count)
-            switch_to_thai()
-            wait_for_layout_change(LANG_THAI)
-            simulate_type(final_thai_text)
-
-            if trigger in ("SPACE", "GIB_SPACE"):
-                simulate_type(" ")
-            elif trigger in ("ENTER", "GIB_ENTER"):
-                controller.press(keyboard.Key.enter)
-                controller.release(keyboard.Key.enter)
-
-            time.sleep(0.1)
-            with key_queue.mutex:
-                key_queue.queue.clear()
-            is_simulating = False
-
+        text = text.translate(thai_to_eng_map)
+        is_gib_eng, thai_text = is_gibberish_english(text)
     elif layout == LANG_THAI:
-        is_gib, eng_text = is_gibberish_thai(text)
-        if is_gib:
-            # Store the *rendered* text (not raw keystrokes) so Ctrl+Shift+Z
-            # can retype it correctly via Unicode injection.
-            last_correction = {
-                'original_text': actual_rendered_text,
-                'corrected_text': eng_text,
-                'original_layout': layout,
-                'new_layout': LANG_ENG,
-                'trigger': trigger
-            }
-            simulate_backspaces(backspace_count)
-            switch_to_eng()
-            wait_for_layout_change(LANG_ENG)
-            simulate_type(eng_text)
+        text = text.translate(eng_to_thai_map)
+        is_gib_thai, eng_text = is_gibberish_thai(text)
 
-            if trigger in ("SPACE", "GIB_SPACE"):
-                simulate_type(" ")
-            elif trigger in ("ENTER", "GIB_ENTER"):
-                controller.press(keyboard.Key.enter)
-                controller.release(keyboard.Key.enter)
+    if is_gib_eng:
+        from pythainlp import word_tokenize
+        from pythainlp.spell import correct
+        from pythainlp.util import isthai
 
-            time.sleep(0.1)
-            with key_queue.mutex:
-                key_queue.queue.clear()
-            is_simulating = False
+        tokens = word_tokenize(thai_text, engine="newmm")
+        fixed = [correct(t) if isthai(t) and t not in valid_thai_words_set else t for t in tokens]
+        final_thai_text = "".join(fixed)
+
+        last_correction = {
+            'original_text': text,
+            'corrected_text': final_thai_text,
+            'original_layout': layout,
+            'new_layout': LANG_THAI,
+            'trigger': trigger
+        }
+        switch_to_thai()
+        wait_for_layout_change(LANG_THAI)
+        simulate_backspaces(backspace_count)
+        type_text_smart(final_thai_text)
+
+        if trigger in ("SPACE", "GIB_SPACE"):
+            simulate_type(" ")
+        elif trigger in ("ENTER", "GIB_ENTER"):
+            controller.press(keyboard.Key.enter)
+            controller.release(keyboard.Key.enter)
+
+        time.sleep(0.1)
+        with key_queue.mutex:
+            key_queue.queue.clear()
+        is_simulating = False
+        return True
+
+    elif is_gib_thai:
+        last_correction = {
+            'original_text': actual_rendered_text,
+            'corrected_text': eng_text,
+            'original_layout': layout,
+            'new_layout': LANG_ENG,
+            'trigger': trigger
+        }
+        switch_to_eng()
+        wait_for_layout_change(LANG_ENG)
+        simulate_backspaces(backspace_count)
+        type_text_smart(eng_text)
+
+        if trigger in ("SPACE", "GIB_SPACE"):
+            simulate_type(" ")
+        elif trigger in ("ENTER", "GIB_ENTER"):
+            controller.press(keyboard.Key.enter)
+            controller.release(keyboard.Key.enter)
+
+        time.sleep(0.1)
+        with key_queue.mutex:
+            key_queue.queue.clear()
+        is_simulating = False
+        return True
+
+    return False
 
 
 def undo_last_correction(add_to_ignore=False):
@@ -285,7 +343,7 @@ def undo_last_correction(add_to_ignore=False):
 
     if is_terminal:
         # Switch layout first so simulated typing gets received correctly
-        if orig_layout == LANG_ENG:
+        if orig_layout & 0x00FF == 0x09:
             switch_to_eng()
             wait_for_layout_change(LANG_ENG)
         else:
@@ -315,7 +373,7 @@ def undo_last_correction(add_to_ignore=False):
     # Switch layout back to what the user was on originally,
     # so their subsequent typing uses the correct layout
     if not is_terminal:
-        if orig_layout == LANG_ENG:
+        if orig_layout & 0x00FF == 0x09:
             switch_to_eng()
         else:
             switch_to_thai()
@@ -327,11 +385,19 @@ def undo_last_correction(add_to_ignore=False):
     last_correction = None
 
 
-def _update_suggestions_for_buffer():
-    """Helper: recompute suggestions from current_word_buffer and push to ui_queue."""
+sugg_timer = None
+
+def _do_update_suggestions(buffer_copy):
     global current_suggestions, selected_suggestion_index
-    if current_word_buffer:
-        suggs, prefix = get_suggestions("".join(current_word_buffer))
+    if buffer_copy:
+        prefix = "".join(buffer_copy)
+        layout = get_current_keyboard_layout()
+        if layout == LANG_ENG:
+            prefix = prefix.translate(thai_to_eng_map)
+        elif layout == LANG_THAI:
+            prefix = prefix.translate(eng_to_thai_map)
+            
+        suggs, prefix = get_suggestions(prefix)
         if suggs or prefix:
             if suggs is None:
                 suggs = []
@@ -341,13 +407,20 @@ def _update_suggestions_for_buffer():
             ui_queue.put((current_suggestions, selected_suggestion_index))
         else:
             current_suggestions = []
-            selected_suggestion_index = 0
             ui_queue.put(None)
     else:
         current_suggestions = []
-        selected_suggestion_index = 0
         ui_queue.put(None)
 
+def _update_suggestions_for_buffer():
+    global sugg_timer
+    if sugg_timer is not None:
+        sugg_timer.cancel()
+    # Pass a copy of the buffer to the thread to avoid race conditions
+    buffer_copy = list(current_word_buffer)
+    import threading
+    sugg_timer = threading.Timer(0.15, _do_update_suggestions, args=[buffer_copy])
+    sugg_timer.start()
 
 def worker_thread():
     global current_word_buffer, current_suggestions, selected_suggestion_index, is_simulating
@@ -375,7 +448,13 @@ def worker_thread():
                 if current_word_buffer:
                     buf_copy = list(current_word_buffer)
                     current_word_buffer.clear()
-                    process_buffer(buf_copy, trigger="ENTER")
+                    corrected = process_buffer(buf_copy, trigger="ENTER")
+                    if not corrected:
+                        is_simulating = True
+                        controller.press(keyboard.Key.enter)
+                        controller.release(keyboard.Key.enter)
+                        time.sleep(0.05)
+                        is_simulating = False
                 else:
                     current_word_buffer.clear()
 
@@ -432,10 +511,19 @@ def accept_suggestion(idx, append_char=None):
     raw_prefix = "".join(current_word_buffer)
 
     layout = get_current_keyboard_layout()
-    is_gib, _ = is_gibberish_english(raw_prefix)
-    target_layout = LANG_THAI if is_gib else layout
+    is_gib_eng, _ = is_gibberish_english(raw_prefix)
+    is_gib_thai, _ = is_gibberish_thai(raw_prefix)
+    
+    if is_gib_eng:
+        target_layout = LANG_THAI
+    elif is_gib_thai:
+        target_layout = LANG_ENG
+    else:
+        has_thai_sugg = any(c in THAI_CHARS for c in suggested_word)
+        target_layout = LANG_THAI if has_thai_sugg else LANG_ENG
 
-    if layout == LANG_THAI:
+    has_thai = any(c in THAI_CHARS for c in raw_prefix)
+    if has_thai:
         # Use rendered text for backspace count AND for storing original (for undo)
         actual_rendered = simulate_thai_output(raw_prefix)
         backspace_count = len(actual_rendered)
@@ -454,12 +542,15 @@ def accept_suggestion(idx, append_char=None):
 
     ui_queue.put(None)
 
-    if is_gib:
+    if target_layout == LANG_THAI:
         switch_to_thai()
         wait_for_layout_change(LANG_THAI)
+    elif target_layout == LANG_ENG:
+        switch_to_eng()
+        wait_for_layout_change(LANG_ENG)
 
     simulate_backspaces(backspace_count)
-    simulate_type(suggested_word)
+    type_text_smart(suggested_word)
 
     if append_char == " ":
         simulate_type(" ")
@@ -582,8 +673,14 @@ def win32_event_filter(msg, data):
                     key_queue.put("CLEAR")
                 return False
 
-        # (Space/Enter are no longer blocked here — they pass through to the OS
-        #  and on_press sends SPACE/ENTER to worker_thread to trigger process_buffer.)
+        # Block Enter if we are in the middle of a word to prevent sending gibberish in chat apps.
+        if current_word_buffer and data.vkCode == 0x0D:
+            if msg in (256, 260):
+                key_queue.put("ENTER")
+            return False
+
+        # (Space is no longer blocked here — it passes through to the OS
+        #  and on_press sends SPACE to worker_thread to trigger process_buffer.)
 
         # --- Global hotkeys (layout-independent via vkCode) ---
         ctrl_pressed = ctypes.windll.user32.GetAsyncKeyState(0x11) & 0x8000
